@@ -19,9 +19,12 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
@@ -133,5 +136,41 @@ class LocalSessionTurnGateTest {
         assertTrue(gate.isRunning(key));
         lease.close();
         assertFalse(gate.isRunning(key));
+    }
+
+    /**
+     * Reproduces the unbounded-map memory leak: every historical session key must be evicted from
+     * the internal {@code gates} map after its lease is closed, otherwise the map grows without
+     * bound and the {@link java.util.concurrent.Semaphore} entries for completed sessions are
+     * never garbage-collected.
+     *
+     * <p>This test currently fails because {@link LocalSessionTurnGate} never removes idle
+     * entries from {@code gates}.
+     */
+    @Test
+    @SuppressWarnings("unchecked")
+    void closedLeaseEvictsIdleEntryFromInternalMap() throws Exception {
+        LocalSessionTurnGate gate = new LocalSessionTurnGate();
+
+        // Simulate N distinct sessions that each complete exactly one turn.
+        int sessionCount = 50;
+        for (int i = 0; i < sessionCount; i++) {
+            TurnLease lease = gate.acquire("session-" + i);
+            lease.close();
+        }
+
+        // After all leases are closed the internal map must be empty: no in-flight session
+        // remains, so every semaphore entry is garbage and must have been evicted.
+        Field gatesField = LocalSessionTurnGate.class.getDeclaredField("gates");
+        gatesField.setAccessible(true);
+        ConcurrentHashMap<?, ?> gatesMap = (ConcurrentHashMap<?, ?>) gatesField.get(gate);
+
+        assertEquals(
+                0,
+                gatesMap.size(),
+                "gates map must be empty after all leases are released; "
+                        + "found "
+                        + gatesMap.size()
+                        + " stale entries — unbounded memory leak");
     }
 }

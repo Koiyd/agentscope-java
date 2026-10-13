@@ -32,7 +32,16 @@ public final class LocalSessionTurnGate implements SessionTurnGate {
     public TurnLease acquire(String key) throws InterruptedException {
         Semaphore semaphore = gates.computeIfAbsent(key, k -> new Semaphore(1, true));
         semaphore.acquire();
-        return semaphore::release;
+        return () -> {
+            semaphore.release();
+            // No thread is waiting for this key: the entry is idle and can be evicted.
+            // ConcurrentHashMap.remove(key, value) is a conditional remove — it only deletes
+            // the entry when its current value is still this semaphore instance, so a
+            // concurrent computeIfAbsent that already inserted a fresh instance is unaffected.
+            if (semaphore.getQueueLength() == 0) {
+                gates.remove(key, semaphore);
+            }
+        };
     }
 
     @Override
